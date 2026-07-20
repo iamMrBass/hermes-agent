@@ -985,6 +985,8 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1118,11 +1120,25 @@ def handle_function_call(
                         enabled_tools=sandbox_enabled,
                     )
             else:
+                # MCP request metadata needs stable per-tool correlation IDs.
+                # Pass them only to MCP handlers so existing built-in/plugin
+                # handler contracts remain unchanged.
+                _entry = registry.get_entry(function_name)
+                _mcp_dispatch_context = {}
+                if _entry is not None and _entry.toolset.startswith("mcp-"):
+                    _mcp_dispatch_context = {
+                        "session_id": session_id,
+                        "tool_call_id": tool_call_id,
+                        "turn_id": turn_id,
+                        "api_request_id": api_request_id,
+                    }
+
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         user_task=user_task,
+                        **_mcp_dispatch_context,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 

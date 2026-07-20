@@ -34,6 +34,8 @@ mcp_servers:
     timeout: 120
     connect_timeout: 60
     supports_parallel_tool_calls: false
+    request_metadata:
+      approval_origin: false
     tools:
       include: []
       exclude: []
@@ -57,9 +59,33 @@ mcp_servers:
 | `timeout` | number | both | Tool call timeout |
 | `connect_timeout` | number | both | Initial connection timeout |
 | `supports_parallel_tool_calls` | bool | both | Allow tools from this server to run concurrently |
+| `request_metadata` | mapping | both | Explicit opt-ins for request-scoped metadata (see below) |
 | `tools` | mapping | both | Filtering and utility-tool policy |
 | `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
+
+## Request metadata
+
+Request metadata is disabled by default and must be enabled separately for
+each trusted server. To let an approval-aware MCP server route a pending
+approval back to the BassHUB dashboard chat that originated the tool call:
+
+```yaml
+mcp_servers:
+  bass_homelab:
+    url: http://homelab-mcp:8420/mcp
+    request_metadata:
+      approval_origin: true
+```
+
+For API-server chat turns, Hermes sends MCP `params._meta` containing the
+namespaced `dev.basshub/origin` object with `surface`, the dashboard chat
+`session_id`, and turn/request correlation IDs. Request IDs are opaque and
+unique per tool invocation; servers must not infer provider call IDs from
+their format. The metadata is not
+sent from CLI or messaging-platform turns, and it is never sent to servers
+without this explicit opt-in. Treat an origin as routing context only; MCP
+servers must still authenticate the caller and validate chat ownership.
 
 ## `tools` policy keys
 

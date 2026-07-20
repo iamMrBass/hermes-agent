@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+from contextvars import copy_context
 
 logger = logging.getLogger(__name__)
 import os
@@ -39,6 +40,20 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+def _submit_with_context(executor, target, /, *args, **kwargs):
+    """Submit *target* with an isolated copy of the caller's ContextVars.
+
+    Delegate execution crosses two executor boundaries (the parallel batch
+    pool and each child's hard-timeout pool). A fresh context copy per submit
+    preserves gateway chat/approval routing without sharing a Context object
+    between concurrent workers. This deliberately propagates ContextVars only:
+    the timeout executor's initializer remains authoritative for its
+    thread-local subagent approval callback.
+    """
+    context = copy_context()
+    return executor.submit(context.run, target, *args, **kwargs)
 
 
 # Tools that children must never have access to
@@ -1561,7 +1576,10 @@ def _run_single_child(
                 task_id=child_task_id,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        _child_future = _submit_with_context(
+            _timeout_executor,
+            _run_with_thread_capture,
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2154,7 +2172,8 @@ def delegate_task(
         with ThreadPoolExecutor(max_workers=max_children) as executor:
             futures = {}
             for i, t, child in children:
-                future = executor.submit(
+                future = _submit_with_context(
+                    executor,
                     _run_single_child,
                     task_index=i,
                     goal=t["goal"],

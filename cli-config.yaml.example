@@ -811,6 +811,8 @@ platform_toolsets:
 # Optional per-server settings:
 #   timeout: tool call timeout in seconds (default: 120)
 #   connect_timeout: initial connection timeout (default: 60)
+#   request_metadata.approval_origin: forward dashboard chat origin metadata
+#     for in-chat approvals (default: false; enable only for a trusted server)
 #
 # mcp_servers:
 #   time:
@@ -826,6 +828,10 @@ platform_toolsets:
 #     args: ["-y", "@modelcontextprotocol/server-github"]
 #     env:
 #       GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_..."
+#   bass_homelab:
+#     url: http://homelab-mcp:8420/mcp
+#     request_metadata:
+#       approval_origin: true
 #
 # Sampling (server-initiated LLM requests) — enabled by default.
 # Per-server config under the 'sampling' key:

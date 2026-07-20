@@ -30,6 +30,8 @@ Example config::
         headers:
           Authorization: "Bearer sk-..."
         timeout: 180
+        request_metadata:
+          approval_origin: true  # opt in to dashboard-chat approval routing metadata
       searxng:
         url: "http://localhost:8000/sse"
         transport: sse       # use SSE transport instead of Streamable HTTP
@@ -79,6 +81,7 @@ Thread safety:
 
 import asyncio
 import concurrent.futures
+import hashlib
 import inspect
 import json
 import logging
@@ -89,6 +92,7 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
@@ -2726,7 +2730,88 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
 # Handler / check-fn factories
 # ---------------------------------------------------------------------------
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+_BASSHUB_APPROVAL_ORIGIN_META_KEY = "dev.basshub/origin"
+_MAX_APPROVAL_ORIGIN_ID_CHARS = 256
+
+
+def _approval_origin_id(value: Any) -> str:
+    """Return a bounded printable correlation ID, or ``""`` when invalid."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or len(text) > _MAX_APPROVAL_ORIGIN_ID_CHARS:
+        return ""
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in text):
+        return ""
+    return text
+
+
+def _snapshot_approval_origin_metadata(handler_kwargs: dict) -> Optional[Dict[str, Any]]:
+    """Snapshot BassHUB dashboard origin metadata in the caller's context.
+
+    Gateway session values are ContextVar-backed. They must be read in this
+    synchronous handler, before work moves to the dedicated MCP event-loop
+    thread, otherwise the loop task would see its own empty/stale context.
+
+    Only API-server turns are eligible: identifiers from Telegram, Discord,
+    and other gateways are not BassHUB ChatStore IDs. The per-server config
+    gate is applied by :func:`_make_tool_handler` before this helper is called.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+        if platform != "api_server":
+            return None
+        chat_session_id = _approval_origin_id(
+            get_session_env("HERMES_SESSION_CHAT_ID", "")
+        )
+    except Exception:
+        return None
+
+    if not chat_session_id:
+        return None
+
+    origin: Dict[str, str] = {
+        "surface": "chat",
+        "session_id": chat_session_id,
+    }
+    # BassHUB deduplicates reconnect retries by (turn_id, request_id), so an
+    # origin must always carry a stable turn identity. Prefer the model turn,
+    # then the API request correlation; if neither is valid, generate one in
+    # this per-handler snapshot so reconnect retries reuse it unchanged.
+    turn_id = (
+        _approval_origin_id(handler_kwargs.get("turn_id"))
+        or _approval_origin_id(handler_kwargs.get("api_request_id"))
+        or f"turn-{uuid.uuid4().hex}"
+    )
+    origin["turn_id"] = turn_id
+
+    # Provider tool-call IDs are not guaranteed to be globally unique (some
+    # providers reuse them on later turns), so scope a supplied ID to the turn
+    # before hashing it into a bounded opaque correlation ID. If either half
+    # is unavailable, generate an invocation-local ID: two MCP calls in one
+    # model response share the same api_request_id and must not deduplicate one
+    # another. This helper runs once per sync handler invocation, so both IDs
+    # remain unchanged when the closed-over _call coroutine is retried.
+    tool_call_id = _approval_origin_id(handler_kwargs.get("tool_call_id"))
+    if tool_call_id:
+        correlation = f"{turn_id}\0{tool_call_id}".encode("utf-8")
+        request_id = f"tool-{hashlib.sha256(correlation).hexdigest()}"
+    else:
+        request_id = f"req-{uuid.uuid4().hex}"
+    origin["request_id"] = request_id
+
+    return {_BASSHUB_APPROVAL_ORIGIN_META_KEY: origin}
+
+
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    tool_timeout: float,
+    *,
+    forward_approval_origin: bool = False,
+):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
@@ -2768,9 +2853,24 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
+        # Snapshot ContextVar-backed gateway identity on the calling thread.
+        # The immutable-by-convention dict is then closed over by _call so an
+        # auth/session reconnect retry sends exactly the same request origin.
+        request_meta = (
+            _snapshot_approval_origin_metadata(kwargs)
+            if forward_approval_origin
+            else None
+        )
+
         async def _call():
             async with server._rpc_lock:
-                result = await server.session.call_tool(tool_name, arguments=args)
+                call_kwargs: Dict[str, Any] = {"arguments": args}
+                if request_meta is not None:
+                    # The MCP Python SDK serializes ``meta`` as the protocol's
+                    # params._meta object. Keep it absent for every server that
+                    # has not explicitly opted in.
+                    call_kwargs["meta"] = request_meta
+                result = await server.session.call_tool(tool_name, **call_kwargs)
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
                 error_text = ""
@@ -3378,6 +3478,24 @@ def _parse_boolish(value: Any, default: bool = True) -> bool:
     return default
 
 
+def _approval_origin_metadata_enabled(server_name: str, config: dict) -> bool:
+    """Return the explicit per-server approval-origin metadata opt-in."""
+    request_metadata = config.get("request_metadata")
+    if request_metadata is None:
+        return False
+    if not isinstance(request_metadata, dict):
+        logger.warning(
+            "MCP config mcp_servers.%s.request_metadata must be a mapping; "
+            "approval origin metadata remains disabled",
+            server_name,
+        )
+        return False
+    return _parse_boolish(
+        request_metadata.get("approval_origin"),
+        default=False,
+    )
+
+
 _UTILITY_CAPABILITY_METHODS = {
     "list_resources": "list_resources",
     "read_resource": "read_resource",
@@ -3512,6 +3630,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     tools_filter = config.get("tools") or {}
     include_set = _normalize_name_filter(tools_filter.get("include"), f"mcp_servers.{name}.tools.include")
     exclude_set = _normalize_name_filter(tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude")
+    forward_approval_origin = _approval_origin_metadata_enabled(name, config)
 
     def _should_register(tool_name: str) -> bool:
         if include_set:
@@ -3545,7 +3664,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             name=tool_name_prefixed,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, mcp_tool.name, server.tool_timeout),
+            handler=_make_tool_handler(
+                name,
+                mcp_tool.name,
+                server.tool_timeout,
+                forward_approval_origin=forward_approval_origin,
+            ),
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],

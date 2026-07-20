@@ -3703,6 +3703,16 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
         approval_session_key = gateway_session_key or session_id or run_id
+        # BassHUB ChatStore keys are exactly 32 lowercase hex characters.
+        # Only expose a run's session as dashboard chat routing context when
+        # it has that exact shape: generated run IDs and general API session
+        # names must never be mistaken for BassHUB-owned chats.
+        approval_chat_id = (
+            session_id
+            if isinstance(session_id, str)
+            and re.fullmatch(r"[0-9a-f]{32}", session_id)
+            else ""
+        )
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
@@ -3784,7 +3794,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         approval_token = set_current_session_key(approval_session_key)
                         session_tokens = set_session_vars(
                             platform="api_server",
+                            chat_id=approval_chat_id,
                             session_key=approval_session_key,
+                            session_id=str(session_id or ""),
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
                         r = agent.run_conversation(

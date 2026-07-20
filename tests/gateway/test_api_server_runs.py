@@ -255,6 +255,64 @@ class TestRunStatus:
                 assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
                 assert status["session_id"] == "space-session"
 
+    @pytest.mark.parametrize(
+        ("session_id", "expected_chat_id"),
+        [
+            ("a" * 32, "a" * 32),
+            ("A" * 32, ""),
+            ("space-session", ""),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_run_binds_only_basshub_chatstore_ids_as_chat_origin(
+        self,
+        adapter,
+        session_id,
+        expected_chat_id,
+    ):
+        from gateway.session_context import get_session_env
+
+        captured = {}
+
+        def _run_in_bound_context(**_kwargs):
+            captured.update(
+                platform=get_session_env("HERMES_SESSION_PLATFORM"),
+                chat_id=get_session_env("HERMES_SESSION_CHAT_ID"),
+                session_id=get_session_env("HERMES_SESSION_ID"),
+            )
+            return {"final_response": "done"}
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.side_effect = _run_in_bound_context
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": session_id},
+                )
+                assert resp.status == 202
+                data = await resp.json()
+
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{data['run_id']}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "completed"
+        assert captured == {
+            "platform": "api_server",
+            "chat_id": expected_chat_id,
+            "session_id": session_id,
+        }
+
     @pytest.mark.asyncio
     async def test_status_not_found_returns_404(self, adapter):
         app = _create_runs_app(adapter)
