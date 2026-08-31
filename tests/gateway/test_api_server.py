@@ -847,6 +847,79 @@ class TestToolsetsEndpoint:
 
 class TestChatCompletionsEndpoint:
     @pytest.mark.asyncio
+    async def test_authenticated_external_turn_id_reaches_agent(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+                return_value=({"final_response": "ok"}, {}),
+            ) as run:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Turn-Id": "run_01HZX9-safe",
+                    },
+                    json={"messages": [{"role": "user", "content": "hi"}]},
+                )
+
+        assert response.status == 200
+        assert run.call_args.kwargs["external_turn_id"] == "run_01HZX9-safe"
+
+    @pytest.mark.asyncio
+    async def test_external_turn_id_requires_configured_authentication(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Turn-Id": "run-a"},
+                    json={"messages": [{"role": "user", "content": "hi"}]},
+                )
+
+        assert response.status == 403
+        run.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "value", ["", "has-trailing ", "has space", "a" * 129, "bad/turn"]
+    )
+    async def test_external_turn_id_rejects_malformed_values(self, auth_adapter, value):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as run:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Turn-Id": value,
+                    },
+                    json={"messages": [{"role": "user", "content": "hi"}]},
+                )
+
+        assert response.status == 400
+        run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_external_turn_id_preserves_legacy_agent_signature(self, adapter):
+        agent = MagicMock()
+        agent.run_conversation.return_value = {"final_response": "ok"}
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            await adapter._run_agent(
+                user_message="hi",
+                conversation_history=[],
+                session_id="session-1",
+            )
+
+        agent.run_conversation.assert_called_once_with(
+            user_message="hi",
+            conversation_history=[],
+            task_id="session-1",
+        )
+
+    @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
