@@ -376,6 +376,7 @@ def run_conversation(
     task_id: str = None,
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[str] = None,
+    external_turn_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -412,6 +413,7 @@ def run_conversation(
         task_id,
         stream_callback,
         persist_user_message,
+        external_turn_id,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,
